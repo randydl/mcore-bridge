@@ -21,7 +21,7 @@ from megatron.core.utils import deprecate_inference_params
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
 from torch import nn
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from mcore_bridge.utils import get_logger, is_flash_attn_3_available
 
@@ -470,6 +470,59 @@ def _patch_mtp():
         return hidden_states, input_ids, position_ids
 
     MultiTokenPredictionLayer.forward = forward
+
+    def _get_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        embedding: Callable,
+        hidden_states: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        from megatron.core.transformer.multi_token_prediction import roll_tensor
+        from megatron.core.utils import make_viewless_tensor
+
+        # Calc logits for the current Multi-Token Prediction (MTP) layers.
+        input_ids, _ = roll_tensor(
+            input_ids,
+            shifts=-1,
+            dims=-1,
+            cp_group=self.cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+        position_ids, _ = roll_tensor(
+            position_ids,
+            shifts=-1,
+            dims=-1,
+            cp_group=self.cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+        # embedding
+        if isinstance(embedding, tuple):
+            embedding, decoder_input = embedding
+        else:
+            decoder_input = None
+        if decoder_input is None:
+            decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        else:
+            enable_sp = self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1
+            if enable_sp:
+                decoder_input = gather_from_sequence_parallel_region(decoder_input)
+            decoder_input, _ = roll_tensor(
+                decoder_input.transpose(0, 2),
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            decoder_input = decoder_input.transpose(0, 2).contiguous()
+            if enable_sp:
+                decoder_input = scatter_to_sequence_parallel_region(decoder_input)
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        return input_ids, position_ids, decoder_input, hidden_states
+
+    MultiTokenPredictionLayer._get_embeddings = _get_embeddings
 
 
 def _patch_peft_ModulesToSaveWrapper():
